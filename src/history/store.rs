@@ -1825,12 +1825,20 @@ impl Store {
                     .and_then(|v| v.as_str())
                     .map(String::from);
                 let sql_title: Option<String> = r.get("title");
-                let title = sql_title.or_else(|| {
-                    metadata
-                        .get("routine_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                });
+                let title = sql_title
+                    .or_else(|| {
+                        metadata
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    })
+                    .or_else(|| {
+                        metadata
+                            .get("routine_name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    });
                 ConversationSummary {
                     id: r.get("id"),
                     title,
@@ -1887,12 +1895,20 @@ impl Store {
                 // For routine/heartbeat threads, derive title from metadata
                 // since they may have no user messages.
                 let sql_title: Option<String> = r.get("title");
-                let title = sql_title.or_else(|| {
-                    metadata
-                        .get("routine_name")
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                });
+                let title = sql_title
+                    .or_else(|| {
+                        metadata
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    })
+                    .or_else(|| {
+                        metadata
+                            .get("routine_name")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    });
                 ConversationSummary {
                     id: r.get("id"),
                     title,
