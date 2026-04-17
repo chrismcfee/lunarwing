@@ -104,6 +104,9 @@ pub async fn chat_ws_handler(
     }))
 }
 
+// TODO(web-gateway): Duplicate of the route-bound chat_threads_handler in
+// server.rs on staging; keep these paths in sync until the handlers are
+// deduplicated.
 pub async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,

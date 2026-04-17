@@ -2708,6 +2708,68 @@ struct HistoryQuery {
     before: Option<String>,
 }
 
+fn stable_engine_history_message_id(
+    thread_id: Uuid,
+    index: usize,
+    role: &str,
+    timestamp: &chrono::DateTime<chrono::Utc>,
+    content: &str,
+) -> Uuid {
+    let seed = format!(
+        "engine-v2-history\x1f{thread_id}\x1f{index}\x1f{role}\x1f{}\x1f{content}",
+        timestamp.to_rfc3339()
+    );
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes())
+}
+
+fn engine_history_entry_to_message(
+    thread_id: Uuid,
+    index: usize,
+    entry: &serde_json::Value,
+) -> Option<crate::history::ConversationMessage> {
+    let Some(role_raw) = entry.get("role").and_then(|v| v.as_str()) else {
+        return None;
+    };
+    let role = match role_raw {
+        "User" => "user",
+        "Assistant" => "assistant",
+        _ => return None,
+    };
+    let Some(timestamp_raw) = entry.get("timestamp").and_then(|v| v.as_str()) else {
+        tracing::warn!(
+            thread_id = %thread_id,
+            index,
+            "Skipping engine v2 history message without a valid timestamp"
+        );
+        return None;
+    };
+    let timestamp = match chrono::DateTime::parse_from_rfc3339(timestamp_raw) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(error) => {
+            tracing::warn!(
+                thread_id = %thread_id,
+                index,
+                timestamp = timestamp_raw,
+                %error,
+                "Skipping engine v2 history message with malformed timestamp"
+            );
+            return None;
+        }
+    };
+    let content = entry
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(crate::history::ConversationMessage {
+        id: stable_engine_history_message_id(thread_id, index, role, &timestamp, &content),
+        role: role.to_string(),
+        content,
+        created_at: timestamp,
+    })
+}
+
 async fn engine_pending_gate_info(
     user_id: &str,
     thread_id: Option<&str>,
@@ -2844,10 +2906,24 @@ async fn chat_history_handler(
     if query.thread_id.is_some() {
         let mut owned = false;
         if let Some(ref store) = state.store {
-            owned = store
+            owned = match store
                 .conversation_belongs_to_user(thread_id, &user.user_id)
                 .await
-                .unwrap_or(false);
+            {
+                Ok(owned) => owned,
+                Err(error) => {
+                    tracing::error!(
+                        thread_id = %thread_id,
+                        user_id = %user.user_id,
+                        %error,
+                        "Failed to verify conversation ownership"
+                    );
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Database error".to_string(),
+                    ));
+                }
+            };
         }
         if !owned && sess.threads.contains_key(&thread_id) {
             owned = true;
@@ -2947,34 +3023,12 @@ async fn chat_history_handler(
     if let Ok(Some(detail)) =
         crate::bridge::get_engine_thread(&thread_id.to_string(), &user.user_id).await
     {
-        let mut synthetic: Vec<crate::history::ConversationMessage> = Vec::new();
-        for entry in &detail.messages {
-            let Some(role_raw) = entry.get("role").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let content = entry
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let ts = entry
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
-            let role = match role_raw {
-                "User" => "user",
-                "Assistant" => "assistant",
-                _ => continue,
-            };
-            synthetic.push(crate::history::ConversationMessage {
-                id: uuid::Uuid::new_v4(),
-                role: role.to_string(),
-                content,
-                created_at: ts,
-            });
-        }
+        let synthetic: Vec<crate::history::ConversationMessage> = detail
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| engine_history_entry_to_message(thread_id, index, entry))
+            .collect();
         if !synthetic.is_empty() {
             let oldest_timestamp = synthetic.first().map(|m| m.created_at.to_rfc3339());
             let mut turns = build_turns_from_db_messages(&synthetic);
@@ -2999,6 +3053,9 @@ async fn chat_history_handler(
     }))
 }
 
+// TODO(web-gateway): This staging branch still carries a duplicate
+// chat_threads_handler in handlers/chat.rs. Keep v2 thread visibility changes
+// in sync until the route-bound handlers are deduplicated.
 async fn chat_threads_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -4108,6 +4165,92 @@ mod tests {
     fn test_build_turns_from_db_messages_empty() {
         let turns = build_turns_from_db_messages(&[]);
         assert!(turns.is_empty());
+    }
+
+    #[test]
+    fn test_engine_history_entry_skips_malformed_timestamp() {
+        let thread_id = Uuid::new_v4();
+        let entry = serde_json::json!({
+            "role": "User",
+            "content": "hello",
+            "timestamp": "not-a-timestamp",
+        });
+
+        let message = engine_history_entry_to_message(thread_id, 0, &entry);
+
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn test_engine_history_entry_uses_stable_id() {
+        let thread_id = Uuid::new_v4();
+        let entry = serde_json::json!({
+            "role": "Assistant",
+            "content": "stable response",
+            "timestamp": "2026-04-17T09:30:00Z",
+        });
+
+        let first = engine_history_entry_to_message(thread_id, 3, &entry).expect("first message");
+        let second = engine_history_entry_to_message(thread_id, 3, &entry).expect("second message");
+        let shifted =
+            engine_history_entry_to_message(thread_id, 4, &entry).expect("shifted message");
+
+        assert_eq!(first.id, second.id);
+        assert_ne!(first.id, shifted.id);
+        assert_eq!(first.role, "assistant");
+        assert_eq!(first.content, "stable response");
+        assert_eq!(first.created_at.to_rfc3339(), "2026-04-17T09:30:00+00:00");
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_chat_history_returns_500_when_ownership_lookup_errors() {
+        use crate::db::libsql::LibSqlBackend;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("broken.db");
+        let backend = LibSqlBackend::new_local(&db_path)
+            .await
+            .expect("create backend");
+        <LibSqlBackend as Database>::run_migrations(&backend)
+            .await
+            .expect("migrate backend");
+        let conn = backend.connect().await.expect("connect backend");
+        conn.execute(
+            "ALTER TABLE conversations RENAME TO conversations_broken",
+            (),
+        )
+        .await
+        .expect("break ownership lookup");
+
+        let store: Arc<dyn Database> = Arc::new(backend);
+        let mut state = test_gateway_state_with_dependencies(None, Some(store), None, None);
+        Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned")
+            .session_manager = Some(Arc::new(SessionManager::new()));
+
+        let result = chat_history_handler(
+            State(state),
+            AuthenticatedUser(UserIdentity {
+                user_id: "alice".to_string(),
+                role: "admin".to_string(),
+                workspace_read_scopes: Vec::new(),
+            }),
+            Query(HistoryQuery {
+                thread_id: Some(Uuid::new_v4().to_string()),
+                limit: None,
+                before: None,
+            }),
+        )
+        .await;
+
+        match result {
+            Err((status, message)) => {
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(message, "Database error");
+            }
+            Ok(_) => panic!("ownership lookup failure should not return history"),
+        }
     }
 
     #[test]

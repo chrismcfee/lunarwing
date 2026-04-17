@@ -3537,7 +3537,7 @@ function loadThreads() {
       window._pendingThreadRestore = null;
       var inSidebar = (pendingId === assistantThreadId) ||
         threads.some(function(t) { return t.id === pendingId; });
-      if (!inSidebar) {
+      if (!inSidebar && window.DEBUG_CHAT_RESTORE === true) {
         console.warn('[chat] thread', pendingId, 'not in sidebar list; loading via history API');
       }
       switchThread(pendingId);
