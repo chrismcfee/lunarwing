@@ -109,6 +109,7 @@ async fn resolve_extension_for_action(
 /// to the action name (since they don't have a credential name to use).
 async fn resolve_auth_gate_display_name(
     auth_manager: Option<&AuthManager>,
+    extension_manager: Option<&crate::extensions::ExtensionManager>,
     tools: &crate::tools::ToolRegistry,
     pending: &PendingGate,
 ) -> String {
@@ -118,7 +119,7 @@ async fn resolve_auth_gate_display_name(
     {
         resolve_extension_for_action(
             auth_manager,
-            None,
+            extension_manager,
             tools,
             &pending.action_name,
             &pending.parameters,
@@ -355,10 +356,12 @@ async fn notify_pending_gate(
     sse: Option<Arc<SseManager>>,
     tools: &crate::tools::ToolRegistry,
     auth_manager: Option<&AuthManager>,
+    extension_manager: Option<&crate::extensions::ExtensionManager>,
     message: &IncomingMessage,
     pending: &PendingGate,
 ) -> Result<BridgeOutcome, Error> {
-    let auth_display_name = resolve_auth_gate_display_name(auth_manager, tools, pending).await;
+    let auth_display_name =
+        resolve_auth_gate_display_name(auth_manager, extension_manager, tools, pending).await;
 
     if let ironclaw_engine::ResumeKind::External { callback_id } = &pending.resume_kind {
         tracing::debug!(
@@ -417,6 +420,7 @@ async fn insert_and_notify_pending_gate(
         state.sse.clone(),
         state.effect_adapter.tools(),
         state.auth_manager.as_deref(),
+        state.extension_manager.as_deref(),
         message,
         &pending,
     )
@@ -948,7 +952,7 @@ async fn submit_pending_auth_credential(
         match ext_mgr.configure_token(submit_target, token, user_id).await {
             Ok(result) => return Ok(PendingAuthCredentialSubmission::Stored(Box::new(result))),
             Err(crate::extensions::ExtensionError::NotInstalled(_)) => {}
-            Err(other) if other.to_string().contains("not found") => {}
+            Err(crate::extensions::ExtensionError::NotFound(_)) => {}
             Err(other) => return Err(other),
         }
     }
@@ -990,6 +994,21 @@ async fn fail_orphaned_waiting_thread_if_needed(
         return Ok(false);
     }
 
+    fail_waiting_thread(
+        state,
+        user_id,
+        thread_id,
+        "pending gate missing before resume",
+    )
+    .await
+}
+
+async fn fail_waiting_thread(
+    state: &EngineState,
+    user_id: &str,
+    thread_id: ironclaw_engine::ThreadId,
+    reason: &str,
+) -> Result<bool, Error> {
     let Some(mut thread) = state
         .store
         .load_thread(thread_id)
@@ -1004,10 +1023,7 @@ async fn fail_orphaned_waiting_thread_if_needed(
     }
 
     thread
-        .transition_to(
-            ironclaw_engine::ThreadState::Failed,
-            Some("pending gate missing before resume".into()),
-        )
+        .transition_to(ironclaw_engine::ThreadState::Failed, Some(reason.into()))
         .map_err(|e| engine_err("reconcile waiting thread", e))?;
     state
         .store
@@ -2168,6 +2184,8 @@ pub async fn resolve_gate(
                     Ok(PendingAuthCredentialSubmission::SkippedNoBackend) => {
                         let msg =
                             "No auth manager, extension manager, or secrets store available to store credential.".to_string();
+                        fail_waiting_thread(state, &message.user_id, pending.thread_id, &msg)
+                            .await?;
                         let _ = agent
                             .channels
                             .send_status(
@@ -2847,12 +2865,14 @@ async fn handle_with_engine_inner(
             let sse = state.sse.clone();
             let tools = Arc::clone(state.effect_adapter.tools());
             let auth_manager = state.auth_manager.clone();
+            let extension_manager = state.extension_manager.clone();
             drop(guard);
             return notify_pending_gate(
                 agent,
                 sse,
                 tools.as_ref(),
                 auth_manager.as_deref(),
+                extension_manager.as_deref(),
                 message,
                 &pending,
             )
@@ -3366,6 +3386,7 @@ async fn await_thread_outcome(
             {
                 let auth_display_name = resolve_auth_gate_display_name(
                     state.auth_manager.as_deref(),
+                    state.extension_manager.as_deref(),
                     state.effect_adapter.tools(),
                     &pending,
                 )
@@ -5353,6 +5374,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_and_notify_pending_gate_uses_extension_manager_for_auth_display_name() {
+        let store = Arc::new(TestStore::new());
+        let sse = Arc::new(SseManager::new());
+        let (ext_mgr, _wasm_tools_dir, wasm_channels_dir) = test_extension_manager();
+        let channel_name = "test_channel";
+        std::fs::write(
+            wasm_channels_dir
+                .path()
+                .join(format!("{channel_name}.wasm")),
+            b"\0asm fake",
+        )
+        .expect("write fake wasm");
+        std::fs::write(
+            wasm_channels_dir
+                .path()
+                .join(format!("{channel_name}.capabilities.json")),
+            serde_json::json!({
+                "type": "channel",
+                "name": channel_name,
+                "setup": {
+                    "required_secrets": [
+                        {"name": "test_channel_token", "prompt": "Enter token"}
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write capabilities");
+
+        let mut event_stream = Box::pin(
+            sse.subscribe_raw(Some("alice".to_string()))
+                .expect("subscribe raw"),
+        );
+        let (agent, statuses) = make_router_test_agent(Some(Arc::clone(&sse))).await;
+        let mut state = make_expected_test_state(store);
+        state.sse = Some(Arc::clone(&sse));
+        state.extension_manager = Some(ext_mgr);
+
+        let thread_id = ironclaw_engine::ThreadId::new();
+        let pending = PendingGate {
+            action_name: channel_name.to_string(),
+            resume_kind: ironclaw_engine::ResumeKind::Authentication {
+                credential_name: "test_channel_token".to_string(),
+                instructions: "Enter token".to_string(),
+                auth_url: None,
+            },
+            ..sample_pending_gate(
+                "alice",
+                thread_id,
+                ironclaw_engine::ResumeKind::Authentication {
+                    credential_name: "test_channel_token".to_string(),
+                    instructions: "Enter token".to_string(),
+                    auth_url: None,
+                },
+            )
+        };
+        let mut message = crate::channels::IncomingMessage::new("web", "alice", "use test");
+        message.thread_id = Some(thread_id.to_string());
+
+        let result = insert_and_notify_pending_gate(&agent, &state, &message, pending)
+            .await
+            .expect("pending gate inserted");
+
+        assert!(matches!(result, BridgeOutcome::Pending));
+
+        let statuses = statuses.lock().await.clone();
+        assert!(
+            statuses.iter().any(|s| matches!(
+                s,
+                StatusUpdate::AuthRequired { extension_name, .. } if extension_name == channel_name
+            )),
+            "expected AuthRequired status, got: {statuses:?}"
+        );
+
+        let event = event_stream.next().await.expect("gate event");
+        assert!(
+            matches!(
+                &event,
+                AppEvent::GateRequired {
+                    extension_name: Some(extension_name),
+                    ..
+                } if *extension_name == channel_name
+            ),
+            "expected GateRequired auth event with extension-manager name, got: {event:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_with_engine_re_emits_pending_approval_on_follow_up() {
         let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
         let store = Arc::new(TestStore::new());
@@ -6529,6 +6638,129 @@ mod tests {
 
         *lock.write().await = None;
         outcome.expect("router extension-manager auth resume test");
+    }
+
+    #[tokio::test]
+    async fn resolve_gate_fails_waiting_thread_when_no_auth_backend_and_no_resume_output() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+
+        let outcome = async {
+            let store = Arc::new(TestStore::new());
+
+            let mut thread = ironclaw_engine::Thread::new(
+                "goal",
+                ironclaw_engine::ThreadType::Foreground,
+                ironclaw_engine::ProjectId::new(),
+                "alice",
+                ironclaw_engine::ThreadConfig::default(),
+            );
+            thread.state = ironclaw_engine::ThreadState::Waiting;
+            store
+                .save_thread(&thread)
+                .await
+                .expect("save waiting thread");
+
+            let mut conversation = ironclaw_engine::ConversationSurface::new("web", "alice");
+            conversation.track_thread(thread.id);
+            let conversation_id = conversation.id;
+            store
+                .save_conversation(&conversation)
+                .await
+                .expect("save conversation");
+
+            let state = make_expected_test_state(store.clone());
+            state
+                .conversation_manager
+                .bootstrap_user("alice")
+                .await
+                .expect("bootstrap conversations");
+
+            let pending = PendingGate {
+                conversation_id,
+                action_name: "shell".into(),
+                parameters: serde_json::json!({"cmd": "ls"}),
+                resume_kind: ironclaw_engine::ResumeKind::Authentication {
+                    credential_name: "github_token".into(),
+                    instructions: "paste token".into(),
+                    auth_url: None,
+                },
+                resume_output: None,
+                ..sample_pending_gate(
+                    "alice",
+                    thread.id,
+                    ironclaw_engine::ResumeKind::Authentication {
+                        credential_name: "github_token".into(),
+                        instructions: "paste token".into(),
+                        auth_url: None,
+                    },
+                )
+            };
+            state
+                .pending_gates
+                .insert(pending.clone())
+                .await
+                .expect("insert pending gate");
+
+            *lock.write().await = Some(state);
+
+            let (agent, statuses) = make_test_agent_with_status_channel("web").await;
+            let message =
+                IncomingMessage::new("web", "alice", "token").with_thread(thread.id.to_string());
+
+            let result = resolve_gate(
+                &agent,
+                &message,
+                thread.id,
+                pending.request_id,
+                ironclaw_engine::GateResolution::CredentialProvided {
+                    token: "secret-token".into(),
+                },
+            )
+            .await
+            .expect("resolve gate");
+
+            let expected =
+                "No auth manager, extension manager, or secrets store available to store credential.";
+            assert!(matches!(
+                result,
+                BridgeOutcome::Respond(ref text) if text == expected
+            ));
+
+            let statuses = statuses.lock().expect("poisoned").clone();
+            assert!(statuses.iter().any(|status| matches!(
+                status,
+                StatusUpdate::AuthCompleted {
+                    extension_name,
+                    success: false,
+                    message,
+                } if extension_name == "github_token" && message == expected
+            )));
+
+            let saved = store
+                .load_thread(thread.id)
+                .await
+                .expect("load thread")
+                .expect("thread exists");
+            assert_eq!(saved.state, ironclaw_engine::ThreadState::Failed);
+
+            let remaining = lock
+                .read()
+                .await
+                .as_ref()
+                .expect("engine state")
+                .pending_gates
+                .list_for_user("alice")
+                .await;
+            assert!(remaining.is_empty(), "pending gate should stay consumed");
+
+            Ok::<(), crate::error::Error>(())
+        }
+        .await;
+
+        *lock.write().await = None;
+        outcome.expect("router no-auth-backend failure test");
     }
 
     #[tokio::test]
