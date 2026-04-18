@@ -330,34 +330,16 @@ impl AuthManager {
         credential_fallback: &str,
         user_id: &str,
     ) -> String {
-        if matches!(
+        resolve_extension_name_for_auth_flow_with_fallback(
+            Some(self),
+            None,
+            None,
             action_name,
-            "tool_install" | "tool-install" | "tool_activate" | "tool_auth"
-        ) {
-            let trimmed = parameters
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .unwrap_or("");
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-
-        if let Some(tools) = self.tools.as_ref()
-            && let Some(name) = tools.provider_extension_for_tool(action_name).await
-        {
-            return name;
-        }
-
-        if let Some(ext_mgr) = self.extension_manager.as_ref()
-            && let Ok(canonical) = canonicalize_extension_name(action_name)
-            && ext_mgr.extension_info(&canonical, user_id).await.is_ok()
-        {
-            return canonical;
-        }
-
-        credential_fallback.to_string()
+            parameters,
+            credential_fallback,
+            user_id,
+        )
+        .await
     }
 
     pub async fn latent_extension_actions(&self) -> Vec<LatentActionDef> {
@@ -757,6 +739,49 @@ impl AuthManager {
         self.get_setup_instructions(credential_name)
             .unwrap_or_else(|| format!("Provide your {} token", credential_name))
     }
+}
+
+pub(crate) async fn resolve_extension_name_for_auth_flow_with_fallback(
+    auth_manager: Option<&AuthManager>,
+    extension_manager: Option<&crate::extensions::ExtensionManager>,
+    tools: Option<&ToolRegistry>,
+    action_name: &str,
+    parameters: &serde_json::Value,
+    credential_fallback: &str,
+    user_id: &str,
+) -> String {
+    if matches!(
+        action_name,
+        "tool_install" | "tool-install" | "tool_activate" | "tool_auth"
+    ) {
+        let trimmed = parameters
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    let tools = auth_manager.and_then(|mgr| mgr.tools.as_deref()).or(tools);
+    if let Some(tools) = tools
+        && let Some(name) = tools.provider_extension_for_tool(action_name).await
+    {
+        return name;
+    }
+
+    let extension_manager = auth_manager
+        .and_then(|mgr| mgr.extension_manager.as_deref())
+        .or(extension_manager);
+    if let Some(ext_mgr) = extension_manager
+        && let Ok(canonical) = canonicalize_extension_name(action_name)
+        && ext_mgr.extension_info(&canonical, user_id).await.is_ok()
+    {
+        return canonical;
+    }
+
+    credential_fallback.to_string()
 }
 
 #[cfg(test)]

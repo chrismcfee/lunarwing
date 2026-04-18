@@ -2891,24 +2891,18 @@ async fn pending_gate_extension_name(
 
     let parsed_parameters =
         serde_json::from_str::<serde_json::Value>(parameters).unwrap_or(serde_json::Value::Null);
-
-    if let Some(auth_manager) = state.auth_manager.as_ref() {
-        return Some(
-            auth_manager
-                .resolve_extension_name_for_auth_flow(
-                    tool_name,
-                    &parsed_parameters,
-                    credential_name,
-                    user_id,
-                )
-                .await,
-        );
-    }
-
-    // auth_manager is None only when no secrets backend exists (e.g. bare
-    // test harness). Fall back to the raw credential name rather than
-    // duplicating AuthManager resolution logic here.
-    Some(credential_name.clone())
+    Some(
+        crate::bridge::auth_manager::resolve_extension_name_for_auth_flow_with_fallback(
+            state.auth_manager.as_deref(),
+            state.extension_manager.as_deref(),
+            state.tool_registry.as_deref(),
+            tool_name,
+            &parsed_parameters,
+            credential_name,
+            user_id,
+        )
+        .await,
+    )
 }
 
 async fn engine_pending_gate_info(
@@ -4665,6 +4659,26 @@ mod tests {
 
         let extension_name = pending_gate_extension_name(
             state_mut,
+            "test-user",
+            "tool_install",
+            r#"{"name":"telegram"}"#,
+            &ironclaw_engine::ResumeKind::Authentication {
+                credential_name: "telegram_bot_token".to_string(),
+                instructions: "paste token".to_string(),
+                auth_url: None,
+            },
+        )
+        .await;
+
+        assert_eq!(extension_name.as_deref(), Some("telegram"));
+    }
+
+    #[tokio::test]
+    async fn pending_gate_extension_name_uses_install_parameters_without_auth_manager() {
+        let state = test_gateway_state(None);
+
+        let extension_name = pending_gate_extension_name(
+            &state,
             "test-user",
             "tool_install",
             r#"{"name":"telegram"}"#,
