@@ -42,6 +42,8 @@ pub enum ThreadOutcome {
         /// Completed action output that should be injected on resume instead
         /// of re-running the action.
         resume_output: Option<serde_json::Value>,
+        /// Lease snapshot captured when the gate paused the action.
+        paused_lease: Option<crate::types::capability::CapabilityLease>,
     },
 }
 

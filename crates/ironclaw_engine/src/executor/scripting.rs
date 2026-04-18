@@ -1069,6 +1069,7 @@ async fn preflight_action(
                         parameters: params.clone(),
                         resume_kind: crate::gate::ResumeKind::Approval { allow_always: true },
                         resume_output: None,
+                        paused_lease: None,
                     },
                 );
             }

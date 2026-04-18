@@ -470,6 +470,7 @@ async fn requeue_auth_pending_gate(
         expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
         original_message: pending.original_message.clone(),
         resume_output: pending.resume_output.clone(),
+        paused_lease: pending.paused_lease.clone(),
         approval_already_granted: pending.approval_already_granted,
     };
 
@@ -497,6 +498,7 @@ fn pairing_pending_gate_from_auth(pending: &PendingGate, extension_name: &str) -
         expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
         original_message: pending.original_message.clone(),
         resume_output: pending.resume_output.clone(),
+        paused_lease: pending.paused_lease.clone(),
         approval_already_granted: pending.approval_already_granted,
     }
 }
@@ -664,17 +666,21 @@ async fn execute_pending_gate_action(
         .ok_or_else(|| engine_err("load thread", "thread not found"))?;
     let resolved_call_id = resolved_or_synthetic_call_id_for_pending_action(state, pending).await?;
 
-    let lease = state
-        .thread_manager
-        .leases
-        .find_lease_for_action(pending.thread_id, &pending.action_name)
-        .await
-        .ok_or_else(|| {
-            engine_err(
-                "resume lease",
-                format!("no active lease covers action '{}'", pending.action_name),
-            )
-        })?;
+    let lease = if let Some(lease) = pending.paused_lease.clone() {
+        lease
+    } else {
+        state
+            .thread_manager
+            .leases
+            .find_lease_for_action(pending.thread_id, &pending.action_name)
+            .await
+            .ok_or_else(|| {
+                engine_err(
+                    "resume lease",
+                    format!("no active lease covers action '{}'", pending.action_name),
+                )
+            })?
+    };
 
     let exec_ctx = ironclaw_engine::ThreadExecutionContext {
         thread_id: pending.thread_id,
@@ -735,6 +741,7 @@ async fn execute_pending_gate_action(
             parameters,
             resume_kind,
             resume_output,
+            paused_lease,
         }) => {
             let display_parameters = state
                 .effect_adapter
@@ -771,6 +778,7 @@ async fn execute_pending_gate_action(
                     .clone()
                     .or_else(|| Some(message.content.clone())),
                 resume_output: resume_output.map(|value| *value),
+                paused_lease: paused_lease.map(|lease| *lease),
                 approval_already_granted: approval_already_granted
                     || matches!(
                         pending.resume_kind,
@@ -2579,10 +2587,10 @@ pub async fn clear_engine_pending_auth(user_id: &str, thread_id: Option<&str>) {
     if let Some(thread_id) = thread_id {
         match resolve_pending_gate_for_user(&state.pending_gates, user_id, Some(thread_id)).await {
             PendingGateResolution::Resolved(gate)
-                if matches!(
-                    gate.resume_kind,
-                    ironclaw_engine::ResumeKind::Authentication { .. }
-                ) =>
+            if matches!(
+                gate.resume_kind,
+                ironclaw_engine::ResumeKind::Authentication { .. }
+            ) =>
             {
                 let _ = state.pending_gates.discard(&gate.key()).await;
             }
@@ -3205,6 +3213,7 @@ async fn await_thread_outcome(
                     expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
                     original_message: Some(message.content.clone()),
                     resume_output: None,
+                    paused_lease: None,
                     approval_already_granted: false,
                 };
                 let pending_request_id = pending.request_id.to_string();
@@ -3248,6 +3257,7 @@ async fn await_thread_outcome(
             parameters,
             resume_kind,
             resume_output,
+            paused_lease,
         } => {
             use crate::gate::pending::PendingGate;
 
@@ -3282,6 +3292,7 @@ async fn await_thread_outcome(
                 expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
                 original_message: Some(message.content.clone()),
                 resume_output,
+                paused_lease,
                 approval_already_granted: false,
             };
 
@@ -5066,6 +5077,7 @@ mod tests {
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
             original_message: None,
             resume_output: None,
+            paused_lease: None,
             approval_already_granted: false,
         }
     }

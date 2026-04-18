@@ -1828,9 +1828,13 @@ async fn oauth_callback_handler(
         }
     }
 
-    // Clear auth mode regardless of outcome so the next user message goes
-    // through to the LLM instead of being intercepted as a token.
-    clear_auth_mode(&state, &flow.user_id).await;
+    // Clear legacy session auth mode regardless of outcome so the next user
+    // message goes through to the LLM instead of being intercepted as a token.
+    //
+    // Do not clear engine pending auth here: the successful callback path
+    // still needs the pending gate so it can resolve and replay the paused
+    // action, and failed callbacks should leave the gate visible for retry.
+    let _ = clear_session_auth_mode_for_thread(&state, &flow.user_id, None).await;
 
     // After successful OAuth, auto-activate the extension so it moves
     // from "Installed (Authenticate)" → "Active" without a second click.
@@ -1899,39 +1903,33 @@ async fn oauth_callback_handler(
     if success {
         match crate::bridge::resolve_engine_auth_callback(&flow.user_id, &flow.secret_name).await {
             Ok(crate::bridge::AuthCallbackContinuation::ResolveGateExternal {
-                channel,
                 thread_scope,
                 request_id,
+                ..
             }) => {
-                if let Some(tx) = state.msg_tx.read().await.as_ref().cloned() {
-                    let callback =
-                        crate::agent::submission::Submission::ExternalCallback { request_id };
-                    match serde_json::to_string(&callback) {
-                        Ok(content) => {
-                            let msg = web_incoming_message(
-                                &channel,
-                                &flow.user_id,
-                                content,
-                                thread_scope.as_deref(),
-                            );
-                            if let Err(e) = tx.send(msg).await {
-                                tracing::warn!(
-                                    extension = %extension_name,
-                                    user_id = %flow.user_id,
-                                    error = %e,
-                                    "Failed to resolve pending engine auth gate after OAuth callback"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                extension = %extension_name,
-                                user_id = %flow.user_id,
-                                error = %e,
-                                "Failed to serialize external callback submission"
-                            );
-                        }
+                if let Some(thread_id) = thread_scope.as_deref() {
+                    if let Err((_, error)) = dispatch_engine_external_callback(
+                        &state,
+                        &flow.user_id,
+                        thread_id,
+                        &request_id.to_string(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            extension = %extension_name,
+                            user_id = %flow.user_id,
+                            error = %error,
+                            "Failed to resolve pending engine auth gate after OAuth callback"
+                        );
                     }
+                } else {
+                    tracing::warn!(
+                        extension = %extension_name,
+                        user_id = %flow.user_id,
+                        request_id = %request_id,
+                        "OAuth callback matched a pending engine auth gate without a scoped thread id"
+                    );
                 }
             }
             Ok(crate::bridge::AuthCallbackContinuation::ReplayMessage {
@@ -2792,6 +2790,16 @@ async fn clear_auth_mode_for_thread(
     user_id: &str,
     thread_id: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
+    clear_session_auth_mode_for_thread(state, user_id, thread_id).await?;
+    crate::bridge::clear_engine_pending_auth(user_id, thread_id).await;
+    Ok(())
+}
+
+async fn clear_session_auth_mode_for_thread(
+    state: &GatewayState,
+    user_id: &str,
+    thread_id: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
     if let Some(ref sm) = state.session_manager {
         let session = sm.get_or_create_session(user_id).await;
         let mut sess = session.lock().await;
@@ -2810,7 +2818,6 @@ async fn clear_auth_mode_for_thread(
             thread.pending_auth = None;
         }
     }
-    crate::bridge::clear_engine_pending_auth(user_id, thread_id).await;
     Ok(())
 }
 

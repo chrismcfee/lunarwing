@@ -163,6 +163,7 @@ pub async fn execute_action_calls(
                             parameters: call.parameters.clone(),
                             resume_kind: crate::gate::ResumeKind::Approval { allow_always: true },
                             resume_output: None,
+                            paused_lease: None,
                         }),
                     });
                 }
@@ -297,6 +298,11 @@ pub async fn execute_action_calls(
                         allow_always: false,
                     }),
                     resume_output: result.output.get("resume_output").cloned(),
+                    paused_lease: result
+                        .output
+                        .get("paused_lease")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok()),
                 });
             }
             results.push(result);
@@ -358,6 +364,7 @@ fn classify_exec_result(
             parameters,
             resume_kind,
             resume_output,
+            paused_lease,
         }) => {
             let _error_msg = format!("gate paused: {gate_name}");
             let error_result = ActionResult {
@@ -368,6 +375,7 @@ fn classify_exec_result(
                     "gate": gate_name,
                     "resume_kind": serde_json::to_value(&*resume_kind).unwrap_or_default(),
                     "resume_output": resume_output.as_deref().cloned(),
+                    "paused_lease": paused_lease.as_deref().cloned(),
                 }),
                 is_error: true,
                 duration: std::time::Duration::ZERO,
@@ -863,6 +871,7 @@ mod tests {
                     auth_url: None,
                 }),
                 resume_output: None,
+                paused_lease: None,
             })],
         ));
         let leases = Arc::new(LeaseManager::new());
@@ -946,6 +955,7 @@ mod tests {
                         auth_url: None,
                     }),
                     resume_output: None,
+                    paused_lease: None,
                 }),
                 Ok(ActionResult {
                     call_id: String::new(),
