@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/nearai/ironclaw/compare/ironclaw_common-v0.2.0...ironclaw_common-v0.3.0) - 2026-04-18
+
+### Fixed
+
+- *(gateway)* align historical/live tool call cards and preserve tool call correlation ([#2182](https://github.com/nearai/ironclaw/pull/2182))
+- image generation with nearai models ([#1819](https://github.com/nearai/ironclaw/pull/1819))
+
+### Other
+
+- Unify gateway onboarding, auth gates, and pairing flows ([#2515](https://github.com/nearai/ironclaw/pull/2515))
+
 ## [0.2.0](https://github.com/nearai/ironclaw/compare/ironclaw_common-v0.1.0...ironclaw_common-v0.2.0) - 2026-04-11
 
 ### Added

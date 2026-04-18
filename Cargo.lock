@@ -3976,7 +3976,7 @@ dependencies = [
 
 [[package]]
 name = "ironclaw_common"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono-tz",
  "serde",
@@ -4030,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "ironclaw_skills"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "futures",
